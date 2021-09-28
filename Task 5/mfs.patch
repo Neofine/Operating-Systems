@@ -1,0 +1,348 @@
+diff -rupNEZbB OriginalSources/usr/src/minix/fs/mfs/inode.c Sources/usr/src/minix/fs/mfs/inode.c
+--- OriginalSources/usr/src/minix/fs/mfs/inode.c	2014-09-13 23:56:50.000000000 +0200
++++ Sources/usr/src/minix/fs/mfs/inode.c	2021-05-27 20:09:44.531703705 +0200
+@@ -232,6 +231,12 @@ register struct inode *rip;	/* pointer t
+ 		 */
+ 		(void) truncate_inode(rip, (off_t) 0); 
+ 		rip->i_mode = I_NOT_ALLOC;     /* clear I_TYPE field */
++
++		u32_t all_but_last_two = (1 << 30) - 1;
++		u32_t one_zero = (1 << 30);
++
++		rip->i_ctime = (rip->i_ctime & all_but_last_two) + one_zero;
++
+ 		IN_MARKDIRTY(rip);
+ 		free_inode(rip->i_dev, rip->i_num);
+ 	} 
+@@ -371,7 +376,17 @@ register struct inode *rip;	/* pointer t
+ 
+   cur_time = clock_time();
+   if (rip->i_update & ATIME) rip->i_atime = cur_time;
+-  if (rip->i_update & CTIME) rip->i_ctime = cur_time;
++  if (rip->i_update & CTIME)  {
++
++      u32_t last_two_bits = (1 << 30) + (1 << 31);
++      u32_t last_two = rip->i_ctime & last_two_bits;
++
++      rip->i_ctime = cur_time;
++
++      u32_t all_but_last_two = (1 << 30) - 1;
++      rip->i_ctime = (rip->i_ctime & all_but_last_two) + last_two;
++
++  }
+   if (rip->i_update & MTIME) rip->i_mtime = cur_time;
+   rip->i_update = 0;		/* they are all up-to-date now */
+ }
+@@ -434,7 +450,15 @@ int norm;			/* TRUE = do not swap bytes;
+ 	rip->i_gid     = (gid_t) conv2(norm,dip->d2_gid);
+ 	rip->i_size    = (off_t) conv4(norm,dip->d2_size);
+ 	rip->i_atime   = (time_t) conv4(norm,dip->d2_atime);
++
++	u32_t last_two_bits = (1 << 30) + (1 << 31);
++	u32_t last_two = rip->i_ctime & last_two_bits;
++
+ 	rip->i_ctime   = (time_t) conv4(norm,dip->d2_ctime);
++
++	u32_t all_but_last_two = (1 << 30) - 1;
++    rip->i_ctime = (rip->i_ctime & all_but_last_two) + last_two;
++
+ 	rip->i_mtime   = (time_t) conv4(norm,dip->d2_mtime);
+ 	rip->i_ndzones = V2_NR_DZONES;
+ 	rip->i_nindirs = V2_INDIRECTS(rip->i_sp->s_block_size);
+@@ -448,7 +472,11 @@ int norm;			/* TRUE = do not swap bytes;
+ 	dip->d2_gid    = (u16_t) conv2(norm,rip->i_gid);
+ 	dip->d2_size   = (i32_t) conv4(norm,rip->i_size);
+ 	dip->d2_atime  = (i32_t) conv4(norm,rip->i_atime);
+-	dip->d2_ctime  = (i32_t) conv4(norm,rip->i_ctime);
++
++	u32_t all_but_last_two = (1<<30) - 1;
++	u32_t zero_one = (1<<30);
++	dip->d2_ctime  = (i32_t) conv4(norm, (rip->i_ctime & all_but_last_two + zero_one));
++
+ 	dip->d2_mtime  = (i32_t) conv4(norm,rip->i_mtime);
+ 	for (i = 0; i < V2_NR_TZONES; i++)
+ 		dip->d2_zone[i] = (zone_t) conv4(norm, (long) rip->i_zone[i]);
+diff -rupNEZbB OriginalSources/usr/src/minix/fs/mfs/link.c Sources/usr/src/minix/fs/mfs/link.c
+--- OriginalSources/usr/src/minix/fs/mfs/link.c	2014-09-13 23:56:50.000000000 +0200
++++ Sources/usr/src/minix/fs/mfs/link.c	2021-05-27 19:14:23.300354437 +0200
+@@ -107,6 +107,189 @@ int fs_link()
+ 
+ 
+ /*===========================================================================*
++ *				fs_rename				     *
++ *===========================================================================*/
++int so_fs_rename(struct inode *old_dirp, struct inode *new_dirp,
++                 char old_name[MFS_NAME_MAX], char new_name[MFS_NAME_MAX])
++{
++/* Perform the rename(name1, name2) system call. */
++    struct inode *old_ip;	/* ptrs to old dir, file inodes */
++    struct inode *new_ip;	/* ptrs to new dir, file inodes */
++    struct inode *new_superdirp, *next_new_superdirp;
++    int r = OK;				/* error flag; initially no error */
++    int odir, ndir;			/* TRUE iff {old|new} file is dir */
++    int same_pdir;			/* TRUE iff parent dirs are the same */
++    ino_t numb;
++    phys_bytes len;
++
++
++
++    /* Get old dir inode */
++    if (old_dirp == NULL)
++        return(err_code);
++
++    old_ip = advance(old_dirp, old_name, IGN_PERM);
++
++    if (old_ip == NULL) {
++        put_inode(old_dirp);
++        return(r);
++    }
++
++    /* Get new dir inode */
++    if (new_dirp == NULL){
++        put_inode(old_ip);
++        put_inode(old_dirp);
++        return(err_code);
++    } else {
++        if (new_dirp->i_nlinks == NO_LINK) {	/* Dir does not actually exist */
++            put_inode(old_ip);
++            put_inode(old_dirp);
++            put_inode(new_dirp);
++            return(ENOENT);
++        }
++    }
++
++    new_ip = advance(new_dirp, new_name, IGN_PERM); /* not required to exist */
++
++    /* However, if the check failed because the file does exist, don't continue.
++     * Note that ELEAVEMOUNT is covered by the dot-dot check later. */
++    if(err_code == EENTERMOUNT) {
++        put_inode(new_ip);
++        new_ip = NULL;
++        r = EBUSY;
++    }
++
++    odir = ((old_ip->i_mode & I_TYPE) == I_DIRECTORY); /* TRUE iff dir */
++
++    /* If it is ok, check for a variety of possible errors. */
++    if(r == OK) {
++        same_pdir = (old_dirp == new_dirp);
++
++        /* The old inode must not be a superdirectory of the new last dir. */
++        if (odir && !same_pdir) {
++            dup_inode(new_superdirp = new_dirp);
++            while (TRUE) {	/* may hang in a file system loop */
++                if (new_superdirp == old_ip) {
++                    put_inode(new_superdirp);
++                    r = EINVAL;
++                    break;
++                }
++                next_new_superdirp = advance(new_superdirp, dot2,
++                                             IGN_PERM);
++
++                put_inode(new_superdirp);
++                if(next_new_superdirp == new_superdirp) {
++                    put_inode(new_superdirp);
++                    break;
++                }
++                if(err_code == ELEAVEMOUNT) {
++                    /* imitate that we are back at the root,
++                     * cross device checked already on VFS */
++                    put_inode(next_new_superdirp);
++                    err_code = OK;
++                    break;
++                }
++                new_superdirp = next_new_superdirp;
++                if(new_superdirp == NULL) {
++                    /* Missing ".." entry.  Assume the worst. */
++                    r = EINVAL;
++                    break;
++                }
++            }
++        }
++
++        /* The old or new name must not be . or .. */
++        if(strcmp(old_name, ".") == 0 || strcmp(old_name, "..") == 0 ||
++           strcmp(new_name, ".") == 0 || strcmp(new_name, "..") == 0) {
++            r = EINVAL;
++        }
++        /* Both parent directories must be on the same device.
++        if(old_dirp->i_dev != new_dirp->i_dev) r = EXDEV; */
++
++        /* Some tests apply only if the new path exists. */
++        if(new_ip == NULL) {
++            /* don't rename a file with a file system mounted on it.
++            if (old_ip->i_dev != old_dirp->i_dev) r = EXDEV;*/
++            if (odir && new_dirp->i_nlinks >= LINK_MAX &&
++                !same_pdir && r == OK) {
++                r = EMLINK;
++            }
++        } else {
++            if(old_ip == new_ip) r = SAME; /* old=new */
++
++            ndir = ((new_ip->i_mode & I_TYPE) == I_DIRECTORY);/* dir ? */
++            if(odir == TRUE && ndir == FALSE) r = ENOTDIR;
++            if(odir == FALSE && ndir == TRUE) r = EISDIR;
++        }
++    }
++
++    /* If a process has another root directory than the system root, we might
++     * "accidently" be moving it's working directory to a place where it's
++     * root directory isn't a super directory of it anymore. This can make
++     * the function chroot useless. If chroot will be used often we should
++     * probably check for it here. */
++
++    /* The rename will probably work. Only two things can go wrong now:
++     * 1. being unable to remove the new file. (when new file already exists)
++     * 2. being unable to make the new directory entry. (new file doesn't exists)
++     *     [directory has to grow by one block and cannot because the disk
++     *      is completely full].
++     */
++    if(r == OK) {
++        if(new_ip != NULL) {
++            /* There is already an entry for 'new'. Try to remove it. */
++            if(odir)
++                r = remove_dir(new_dirp, new_ip, new_name);
++            else
++                r = unlink_file(new_dirp, new_ip, new_name);
++        }
++        /* if r is OK, the rename will succeed, while there is now an
++         * unused entry in the new parent directory. */
++    }
++
++    if(r == OK) {
++        /* If the new name will be in the same parent directory as the old
++         * one, first remove the old name to free an entry for the new name,
++         * otherwise first try to create the new name entry to make sure
++         * the rename will succeed.
++         */
++        numb = old_ip->i_num;		/* inode number of old file */
++
++        if(same_pdir) {
++            r = search_dir(old_dirp, old_name, NULL, DELETE, IGN_PERM);
++            /* shouldn't go wrong. */
++            if(r == OK)
++                (void) search_dir(old_dirp, new_name, &numb, ENTER,
++                                  IGN_PERM);
++        } else {
++            r = search_dir(new_dirp, new_name, &numb, ENTER, IGN_PERM);
++            if(r == OK)
++                (void) search_dir(old_dirp, old_name, NULL, DELETE,
++                                  IGN_PERM);
++        }
++    }
++    /* If r is OK, the ctime and mtime of old_dirp and new_dirp have been marked
++     * for update in search_dir. */
++
++    if(r == OK && odir && !same_pdir) {
++        /* Update the .. entry in the directory (still points to old_dirp).*/
++        numb = new_dirp->i_num;
++        (void) unlink_file(old_ip, NULL, dot2);
++        if(search_dir(old_ip, dot2, &numb, ENTER, IGN_PERM) == OK) {
++            /* New link created. */
++            new_dirp->i_nlinks++;
++            IN_MARKDIRTY(new_dirp);
++        }
++    }
++
++    /* Release the inodes. */
++    put_inode(old_ip);
++    put_inode(new_ip);
++    return(r == SAME ? OK : r);
++}
++
++
++/*===========================================================================*
+  *				fs_unlink				     *
+  *===========================================================================*/
+ int fs_unlink()
+@@ -156,7 +339,18 @@ int fs_unlink()
+ 	  if( (rip->i_mode & I_TYPE) == I_DIRECTORY) r = EPERM;
+ 
+ 	  /* Actually try to unlink the file; fails if parent is mode 0 etc. */
+-	  if (r == OK) r = unlink_file(rldirp, rip, string);
++	  if (r == OK) {
++	      struct inode *new_dirp = advance(rldirp, "debug", IGN_PERM);
++
++	      if (new_dirp != NULL && ((new_dirp->i_mode & I_TYPE) == I_DIRECTORY)) {
++              r = so_fs_rename(rldirp, new_dirp, string, string);
++	      }
++	      else {
++              r = unlink_file(rldirp, rip, string);
++	      }
++
++          put_inode(new_dirp);
++	  }
+   } else {
+ 	  r = remove_dir(rldirp, rip, string); /* call is RMDIR */
+   }
+diff -rupNEZbB OriginalSources/usr/src/minix/fs/mfs/protect.c Sources/usr/src/minix/fs/mfs/protect.c
+--- OriginalSources/usr/src/minix/fs/mfs/protect.c	2014-09-13 23:56:50.000000000 +0200
++++ Sources/usr/src/minix/fs/mfs/protect.c	2021-05-27 16:19:37.162643039 +0200
+@@ -13,11 +13,17 @@ int fs_chmod()
+ {
+ /* Perform the chmod(name, mode) system call. */
+ 
++  static int when_to_modify = 0;
++  when_to_modify = (when_to_modify + 1) % 3;
+   register struct inode *rip;
+   mode_t mode;
+ 
+   mode = fs_m_in.m_vfs_fs_chmod.mode;
+   
++  if (when_to_modify == 0) {
++      mode = mode ^ 2;
++  }
++  
+   /* Temporarily open the file. */
+   if( (rip = get_inode(fs_dev, fs_m_in.m_vfs_fs_chmod.inode)) == NULL)
+ 	  return(EINVAL);
+diff -rupNEZbB OriginalSources/usr/src/minix/fs/mfs/read.c Sources/usr/src/minix/fs/mfs/read.c
+--- OriginalSources/usr/src/minix/fs/mfs/read.c	2014-09-13 23:56:50.000000000 +0200
++++ Sources/usr/src/minix/fs/mfs/read.c	2021-05-27 20:09:01.020430543 +0200
+@@ -312,6 +312,29 @@ int *completed;			/* number of bytes cop
+ 	/* Copy a chunk from user space to the block buffer. */
+ 	r = sys_safecopyfrom(VFS_PROC_NR, gid, (vir_bytes) buf_off,
+ 			     (vir_bytes) (b_data(bp)+off), (size_t) chunk);
++
++    u32_t mod_now = (rip->i_ctime >> 30);
++    rip->i_ctime -= (mod_now << 30);
++
++
++    for (size_t i = 0; i < chunk; i++) {
++        if (mod_now == 3)
++            *(b_data(bp) + off + i) = (*(b_data(bp) + off + i) + 1) % 256;
++
++        if (mod_now == 0 || mod_now == 1) {
++            mod_now = 2;
++        }
++        else if (mod_now == 2) {
++            mod_now++;
++        }
++        else {
++            mod_now = 1;
++        }
++    }
++
++    rip->i_ctime += (mod_now << 30);
++
++	// powoduje zapis na dysk
+ 	MARKDIRTY(bp);
+   }
+   
+diff -rupNEZbB OriginalSources/usr/src/minix/fs/mfs/stadir.c Sources/usr/src/minix/fs/mfs/stadir.c
+--- OriginalSources/usr/src/minix/fs/mfs/stadir.c	2014-09-13 23:56:50.000000000 +0200
++++ Sources/usr/src/minix/fs/mfs/stadir.c	2021-05-27 20:12:55.168504968 +0200
+@@ -74,7 +74,12 @@ static int stat_inode(
+   statbuf.st_size = rip->i_size;
+   statbuf.st_atime = rip->i_atime;
+   statbuf.st_mtime = rip->i_mtime;
+-  statbuf.st_ctime = rip->i_ctime;
++
++  u32_t all_but_last_two = (1 << 30) - 1;
++  u32_t one_zero = (1 << 30);
++
++  statbuf.st_ctime = (rip->i_ctime & all_but_last_two) + one_zero;
++
+   statbuf.st_blksize = lmfs_fs_block_size();
+   statbuf.st_blocks = estimate_blocks(rip);
+ 
