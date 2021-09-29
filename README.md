@@ -1,4 +1,4 @@
-Projets I have done during Operational Systems course:
+Projects I have done during Operational Systems course:
 - first two are written in NASM
 - next four are projects in which I modify MINIX core.
 
